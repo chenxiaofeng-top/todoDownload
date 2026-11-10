@@ -1,0 +1,32 @@
+:root {
+  color-scheme: light dark;
+  font: 14px/1.55 system-ui, sans-serif;
+  --accent: #2457ad;
+  --accent-text: #fff;
+  --muted: #4c5a6c;
+  --border: #d6dfea;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root { --accent: #a6c7ff; --accent-text: #10274f; --muted: #b9c4d4; --border: #465468; }
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; background: Canvas; color: CanvasText; }
+main { display: grid; gap: 1.25rem; padding: 1.25rem; }
+h1 { font-size: 1.8rem; line-height: 1.15; margin: 0.2rem 0 0.55rem; }
+h2 { font-size: 1rem; margin: 0 0 0.5rem; }
+p { margin: 0; overflow-wrap: anywhere; }
+header p, .hint { color: var(--muted); }
+.eyebrow { font-weight: 650; color: var(--accent); }
+section { padding: 1rem; border: 1px solid var(--border); border-radius: 0.65rem; }
+.actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.75rem; }
+button { border: 1px solid var(--accent); border-radius: 0.35rem; padding: 0.45rem 0.7rem; background: var(--accent); color: var(--accent-text); font: inherit; font-weight: 650; cursor: pointer; }
+button.secondary { background: Canvas; color: var(--accent); }
+button:disabled { opacity: 0.55; cursor: default; }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+progress { width: 100%; margin-top: 0.65rem; accent-color: var(--accent); }
+.hint, #download-status { font-size: 0.9rem; }
+#status { white-space: pre-line; }
+#download-status:not(:empty) { margin-top: 0.65rem; }

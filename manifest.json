@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Microsoft To Do 导出",
+  "description": "将当前 Microsoft To Do 账号的普通清单和任务导出为 CSV 或 JSON。",
+  "version": "1.0.0",
+  "minimum_chrome_version": "116",
+  "permissions": ["sidePanel", "scripting", "downloads"],
+  "host_permissions": ["https://to-do.live.com/*"],
+  "background": {"service_worker": "background.js"},
+  "action": {"default_title": "Microsoft To Do 导出"},
+  "side_panel": {"default_path": "panel.html"}
+}
