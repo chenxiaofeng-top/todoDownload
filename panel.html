@@ -24,8 +24,8 @@
             <option value="completed">仅已完成</option>
           </select>
           <label for="interval">读取动作间隔（毫秒）</label>
-          <input id="interval" type="number" min="250" max="10000" step="1" value="1000" required aria-describedby="interval-hint">
-          <p id="interval-hint" class="hint">间隔越长，导出越慢，可减少短时间内连续打开任务带来的请求。</p>
+          <input id="interval" type="number" min="0" max="10000" step="1" value="1000" required aria-describedby="interval-hint">
+          <p id="interval-hint" class="hint">设为 0 可快速读取，或输入 250–10000 毫秒以减少短时间内连续发出的请求。</p>
         </div>
       </section>
       <section aria-labelledby="status-title">
@@ -44,6 +44,15 @@
           <button id="json" class="secondary" type="button">下载 JSON</button>
         </div>
         <p id="download-status" role="status" aria-live="polite"></p>
+      </section>
+      <section aria-labelledby="diagnostic-title">
+        <h2 id="diagnostic-title">导出诊断</h2>
+        <p class="hint">近期导出日志保存在当前浏览器中。遇到异常后，可下载日志排查。</p>
+        <div class="actions">
+          <button id="download-diagnostics" class="secondary" type="button">下载诊断日志</button>
+        </div>
+        <p id="diagnostic-warning" class="hint" role="status" hidden>部分诊断日志未能保存，报告可能不完整。</p>
+        <p id="diagnostic-status" class="hint" role="status"></p>
       </section>
       <p class="hint">读取时请保留侧栏及扩展打开的 To Do 标签页。任务数据只在浏览器内处理。</p>
     </main>

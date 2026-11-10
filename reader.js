@@ -9,6 +9,8 @@
   const SMART_LISTS = new Set(['important', 'planned', 'assigned_to_me', 'my_day', 'flagged_email', 'completed_tasks']);
   const GRID_VIEW = '.centerColumn-item.grid-view';
   const LIST_VIEW = '.chunkedScrollContainer';
+  const LIST_SETTLE_MS = 220;
+  const COUNT_PROGRESS_TIMEOUT_MS = 12000;
   const DETAILS = '.details';
   let activeRead;
 
@@ -76,7 +78,7 @@
     if (element?.matches('input[type="checkbox"]')) return element.checked;
     const state = element?.getAttribute('aria-checked');
     if (state === 'true' || state === 'false') return state === 'true';
-    throw fail('网页上的任务勾选状态无法识别。');
+    throw fail('网页上的任务勾选状态无法识别。', 'CHECKBOX_UNRECOGNIZED');
   }
 
   function listRows() {
@@ -109,7 +111,7 @@
       opened.add(toggle);
       await pace(() => toggle.isConnected ? toggle.click() : false);
       await waitFor(() => !toggle.isConnected || toggle.getAttribute('aria-expanded') === 'true', 2500, signal,
-        '清单组无法展开。');
+        '清单组无法展开。', 'LIST_GROUP_TIMEOUT');
       await sleep(100, signal);
     }
 
@@ -124,6 +126,13 @@
     return null;
   }
 
+  function emptyListPane(taskInput) {
+    const addTask = taskInput?.closest('.addToTop.centerColumn-item');
+    const pane = addTask?.parentElement;
+    // To Do renders only the add-task area when empty. Loading adds a shimmer beside it.
+    return pane?.matches('.main-background') && pane.childElementCount === 1 && pane.isConnected ? pane : null;
+  }
+
   function detailId() {
     const match = location.pathname.match(/\/tasks\/id\/([^/]+)\/details(?:\/|$)/i);
     return match ? decodeURIComponent(match[1]) : null;
@@ -135,60 +144,84 @@
       if (!detailId()) return true;
       const close = document.querySelector(`${DETAILS} .detailFooter-close`);
       return close?.getClientRects().length && close;
-    }, 4500, signal, '任务详情的关闭按钮未加载。');
+    }, 4500, signal, '任务详情的关闭按钮未加载。', 'DETAIL_CLOSE_BUTTON_TIMEOUT');
     if (button === true) return;
     await pace(() => {
       if (!detailId()) return false;
       button.click();
     });
     // To Do keeps the closed pane mounted for reuse. The route marks it closed.
-    await waitFor(() => !detailId(), 4500, signal, '任务详情未能关闭。');
+    await waitFor(() => !detailId(), 4500, signal, '任务详情未能关闭。', 'DETAIL_CLOSE_TIMEOUT');
   }
 
   async function openList(list, signal, pace) {
     await closeDetails(signal, pace);
     const entry = listRows().find(candidate => candidate.id === list.id);
-    if (!entry) throw fail('清单已从侧栏消失。');
+    if (!entry) throw fail('清单已从侧栏消失。', 'LIST_MISSING');
     if (!entry.row.matches('.active,[aria-selected="true"]')) await pace(() => entry.item.click());
     const selected = () => {
       const current = listRows().find(candidate => candidate.id === list.id);
       return current?.row.matches('.active,[aria-selected="true"]') && current;
     };
+    let emptyPane;
+    let emptySince;
     const result = await waitFor(() => {
       const current = selected();
       const taskInput = document.getElementById(`baseAddInput-addTask-${list.id}`);
       const currentView = view();
       if (current && taskInput && currentView?.root.isConnected) return currentView;
+      const pane = current && !currentView && !openTaskCount(current.row) ? emptyListPane(taskInput) : null;
+      if (pane && pane === emptyPane && performance.now() - emptySince >= LIST_SETTLE_MS) return {empty: true};
+      if (pane !== emptyPane) {
+        emptyPane = pane;
+        emptySince = performance.now();
+      }
       return null;
-    }, 12000, signal, '清单内容未加载。');
+    }, 12000, signal, '清单内容未加载。', 'LIST_TIMEOUT');
+    if (result.empty) return result;
     if (result.root.scrollTop) await pace(() => { result.root.scrollTop = 0; });
-    await sleep(220, signal);
+    await sleep(LIST_SETTLE_MS, signal);
     return {...result, expectedOpen: openTaskCount(selected()?.row)};
   }
 
-  function taskRows(root, grid) {
+  function* unreadRows(root, grid, ids, listPositions) {
     const selector = grid ? '.grid-row [id$="_title"]' : '.taskItem[role="treeitem"]';
-    return [...root.querySelectorAll(selector)].map(element => {
+    const rootTop = grid ? 0 : root.getBoundingClientRect().top;
+    for (const element of root.querySelectorAll(selector)) {
+      if (!element.isConnected) continue;
       if (grid) {
+        const id = element.id.slice(0, -'_title'.length);
+        if (ids.has(id)) continue;
         const row = element.closest('.grid-row');
         const title = text(element.querySelector('.show-ellipsis'));
-        const id = element.id.slice(0, -'_title'.length);
         const checkbox = row.querySelector('[id$="_markTaskAsComplete"] [role="checkbox"]');
         const star = row.querySelector('[id$="_importance"] [role="checkbox"]');
         const dueDate = text(row.querySelector('[id$="_due_date"] .grid-cell-content')) || null;
-        return {element, id, title, checkbox, star, dueDate, trigger: element.querySelector('button.icon-wrapper')};
+        yield {element, id, title, checkbox, star, dueDate, trigger: element.querySelector('button.icon-wrapper')};
+        continue;
       }
       const title = text(element.querySelector('.taskItem-title'));
+      const position = JSON.stringify([Math.round(element.getBoundingClientRect().top - rootTop + root.scrollTop), title]);
+      if (listPositions.has(position)) continue;
       const checkbox = element.querySelector('.taskItem-body .checkBox[role="checkbox"]');
       const star = element.querySelector('.importanceButton[role="checkbox"]');
       const trigger = element.querySelector('button.taskItem-titleWrapper');
-      return {element, title, checkbox, star, dueDate: null, trigger};
-    });
+      yield {element, title, checkbox, star, dueDate: null, trigger, position};
+    }
+  }
+
+  function nextTask(root, grid, ids, listPositions, scope) {
+    for (const row of unreadRows(root, grid, ids, listPositions)) {
+      const completed = boolCheckbox(row.checkbox);
+      if ((scope === 'open' && completed) || (scope === 'completed' && !completed)) continue;
+      return {row, completed};
+    }
+    return null;
   }
 
   function readSteps(details) {
     const container = details.querySelector('.steps');
-    if (!container) throw fail('任务详情中的步骤区域无法识别。');
+    if (!container) throw fail('任务详情中的步骤区域无法识别。', 'STEP_CONTAINER_MISSING');
     const selector = '[role="checkbox"],input[type="checkbox"]';
     return [...container.querySelectorAll(selector)].map(checkbox => {
       let row = checkbox.parentElement;
@@ -201,7 +234,7 @@
       const title = label.replace(/^(?:将(?:步骤\s*)?|标记为(?:未|已)完成\s*|Mark (?:step )?(?:as )?(?:not )?completed?[:\s]*)+/i, '')
         .replace(/\s*(?:标记为(?:未|已)完成|\s+as (?:not )?completed?)\s*$/i, '').trim();
       if (title && title !== label) return {title, completed: boolCheckbox(checkbox)};
-      throw fail('任务子步骤的标题无法识别。');
+      throw fail('任务子步骤的标题无法识别。', 'STEP_TITLE_MISSING');
     });
   }
 
@@ -221,11 +254,12 @@
   }
 
   async function readTask(row, completed, signal, pace) {
-    if (!row.title || !row.trigger) throw fail('网页上的任务标题或详情入口无法识别。');
+    if (!row.title || !row.trigger) throw fail('网页上的任务标题或详情入口无法识别。', 'TASK_ROW_UNRECOGNIZED');
     let important;
     const opened = await pace(() => {
       if (!row.element.isConnected || !row.trigger.isConnected) return false;
-      if (boolCheckbox(row.checkbox) !== completed) throw fail('任务状态在读取期间发生变化。');
+      if (row.id && row.element.id !== `${row.id}_title`) return false;
+      if (boolCheckbox(row.checkbox) !== completed) throw fail('任务状态在读取期间发生变化。', 'TASK_STATE_CHANGED');
       important = boolCheckbox(row.star);
       row.trigger.click();
     });
@@ -238,7 +272,7 @@
           !pane.closest('.rightColumn-exiting, .rightColumn-exited') &&
           pane.querySelector('.detailHeader')?.getClientRects().length &&
           pane.querySelector('.detailNote .ql-editor') && pane;
-      }, 6500, signal, '任务详情或备注未加载。');
+      }, 6500, signal, '任务详情或备注未加载。', 'DETAIL_TIMEOUT');
       const editor = details.querySelector('.detailNote .ql-editor');
       return {
         id: detailId(),
@@ -272,44 +306,55 @@
 
   function checkCounts(open, done, expectedOpen, expectedCompleted) {
     if (expectedOpen !== null && open !== expectedOpen) {
-      throw fail(`未完成任务计数不符，网页显示 ${expectedOpen} 条，读取到 ${open} 条。`);
+      throw Object.assign(fail(`未完成任务计数不符，网页显示 ${expectedOpen} 条，读取到 ${open} 条。`, 'OPEN_COUNT_MISMATCH'),
+        {expected: expectedOpen, observed: open});
     }
     if (expectedCompleted !== null && done !== expectedCompleted) {
-      throw fail(`已完成任务计数不符，网页显示 ${expectedCompleted} 条，读取到 ${done} 条。`);
+      throw Object.assign(fail(`已完成任务计数不符，网页显示 ${expectedCompleted} 条，读取到 ${done} 条。`, 'COMPLETED_COUNT_MISMATCH'),
+        {expected: expectedCompleted, observed: done});
     }
   }
 
   async function scanList(list, signal, pace, scope, onTask) {
-    const {root, grid, expectedOpen} = await openList(list, signal, pace);
+    const {root, grid, expectedOpen: openCount, empty} = await openList(list, signal, pace);
+    if (empty) return 0;
     const ids = new Set();
     const listPositions = new Set();
+    const expectedOpen = scope === 'completed' ? null : openCount;
     let done = 0;
-    let expectedCompleted = 0;
+    let expectedCompleted = scope === 'open' ? null : 0;
     let quietAtEnd = 0;
     let stalled = 0;
+    let largestBottom = 0;
+    let shortfallSince;
 
     while (quietAtEnd < 3) {
       signal.throwIfAborted();
-      if (!root.isConnected) throw fail('任务列表在读取期间重新加载。');
-      const start = root.scrollTop;
+      if (!root.isConnected) throw fail('任务列表在读取期间重新加载。', 'TASK_LIST_REMOUNTED');
       const before = ids.size;
-      const completed = root.querySelector('#completed_tasks-label');
-      if (completed) expectedCompleted = displayedCount(completed.nextElementSibling);
+      if (scope !== 'open') {
+        const completed = root.querySelector('#completed_tasks-label');
+        if (completed) expectedCompleted = displayedCount(completed.nextElementSibling);
+      }
       const expanded = await expandTaskGroups(root, signal, pace, scope);
+      const start = root.scrollTop;
 
-      const rootTop = root.getBoundingClientRect().top;
-      const mounted = taskRows(root, grid).map(row => ({
-        ...row,
-        position: grid ? null : JSON.stringify([Math.round(row.element.getBoundingClientRect().top - rootTop + root.scrollTop), row.title]),
-      }));
-      for (const row of mounted) {
-        if (!row.element.isConnected) continue;
-        if (row.id ? ids.has(row.id) : listPositions.has(row.position)) continue;
-        const completed = boolCheckbox(row.checkbox);
-        if ((scope === 'open' && completed) || (scope === 'completed' && !completed)) continue;
+      // Opening details can replace the mounted rows. Re-query this window before scrolling on.
+      let missed = 0;
+      while (true) {
+        signal.throwIfAborted();
+        if (!root.isConnected) throw fail('任务列表在读取期间重新加载。', 'TASK_LIST_REMOUNTED');
+        const next = nextTask(root, grid, ids, listPositions, scope);
+        if (!next) break;
+        const {row, completed} = next;
         const task = await readTask(row, completed, signal, pace);
-        if (!task) continue;
-        if (row.position !== null) listPositions.add(row.position);
+        if (!task) {
+          if (++missed >= 4) throw fail('任务行在读取期间持续重新渲染。', 'TASK_ROW_REMOUNTED');
+          await sleep(65, signal);
+          continue;
+        }
+        missed = 0;
+        if (row.position !== undefined) listPositions.add(row.position);
         if (!ids.has(task.id)) {
           ids.add(task.id);
           if (task.completed) done++;
@@ -322,20 +367,31 @@
       }
 
       const bottom = Math.max(0, root.scrollHeight - root.clientHeight);
+      if (ids.size > before || bottom > largestBottom + 2) shortfallSince = undefined;
+      largestBottom = Math.max(largestBottom, bottom);
       if (start >= bottom - 2) {
-        quietAtEnd = ids.size === before && !expanded ? quietAtEnd + 1 : 0;
+        const shortfall = (expectedOpen !== null && ids.size - done < expectedOpen) ||
+          (expectedCompleted !== null && done < expectedCompleted);
+        if (shortfall) {
+          // The current bottom can move as To Do mounts more tasks.
+          quietAtEnd = 0;
+          shortfallSince ??= performance.now();
+          if (performance.now() - shortfallSince >= COUNT_PROGRESS_TIMEOUT_MS) break;
+        } else {
+          shortfallSince = undefined;
+          quietAtEnd = ids.size === before && !expanded ? quietAtEnd + 1 : 0;
+        }
         await sleep(240, signal);
       } else {
         quietAtEnd = 0;
         await pace(() => { root.scrollTop = Math.min(bottom, start + Math.max(60, Math.floor(root.clientHeight * 0.7))); });
         await sleep(100, signal);
         stalled = root.scrollTop <= start ? stalled + 1 : 0;
-        if (stalled >= 3) throw fail('任务列表无法继续滚动。');
+        if (stalled >= 3) throw fail('任务列表无法继续滚动。', 'SCROLL_STALLED');
       }
     }
 
-    checkCounts(ids.size - done, done, scope === 'completed' ? null : expectedOpen,
-      scope === 'open' ? null : expectedCompleted);
+    checkCounts(ids.size - done, done, expectedOpen, expectedCompleted);
     return ids.size;
   }
 
@@ -345,8 +401,10 @@
     let count = 0;
 
     for (const [offset, list] of lists.entries()) {
+      const index = offset + 1;
+      let attemptCount;
       const readList = async retry => {
-        const index = offset + 1;
+        attemptCount = 0;
         port.postMessage({type: 'list-start', list, index, total: lists.length, count, retry});
         let batch = [];
         let batchSize = 0;
@@ -357,6 +415,7 @@
         }
         let lastProgress = -Infinity;
         const size = await scanList(list, signal, pace, scope, async (task, size) => {
+          attemptCount = size;
           const length = JSON.stringify(task).length;
           if (batchSize + length > 64 * 1024) await flush();
           batch.push(task);
@@ -372,16 +431,22 @@
         port.postMessage({type: 'list-end', index, size});
         return size;
       };
+      function reportListError(error, retries) {
+        port.postMessage({type: 'list-error', index, count: count + attemptCount, retries,
+          code: error.code, expected: error.expected, observed: error.observed});
+      }
       try {
         count += await readList(false);
       } catch (error) {
         signal.throwIfAborted();
+        reportListError(error, 0);
         if (error.code === 'TRANSFER') throw error;
         try {
           count += await readList(true);
         } catch (error) {
           signal.throwIfAborted();
-          throw fail(`「${list.name}」读取失败。${error.message}`);
+          reportListError(error, 1);
+          throw fail(`「${list.name}」读取失败。${error.message}`, error.code);
         }
       }
     }
@@ -432,7 +497,8 @@
       try {
         const scope = message.scope ?? 'all';
         const intervalMs = message.intervalMs ?? 1000;
-        if (!['all', 'open', 'completed'].includes(scope) || !Number.isInteger(intervalMs) || intervalMs < 250 || intervalMs > 10000) {
+        const validInterval = Number.isInteger(intervalMs) && (intervalMs === 0 || (intervalMs >= 250 && intervalMs <= 10000));
+        if (!['all', 'open', 'completed'].includes(scope) || !validInterval) {
           throw fail('读取设置无效。');
         }
         await readAll(port, signal, {scope, intervalMs}, sendBatch);

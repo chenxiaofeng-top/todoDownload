@@ -6,8 +6,14 @@ import {fileURLToPath} from 'node:url';
 const endpoint = 'http://127.0.0.1:9222';
 const pid = Number(process.argv[2]);
 const startedAt = Date.now();
-const stages = new Set(['open', 'login', 'discover', 'scan', 'retry', 'ready', 'failed', 'cancelled',
+const stages = new Set(['open', 'login', 'discover', 'scan', 'retry', 'list-error', 'ready', 'failed', 'cancelled',
   'build-csv', 'build-json', 'download-csv', 'download-json', 'saved', 'save-failed']);
+const errorCodes = new Set(['UNKNOWN', 'NOT_READY', 'DISCONNECTED', 'CONNECT_TIMEOUT', 'TRANSFER', 'TAB_CLOSED', 'PAGE_TIMEOUT',
+  'LIST_ORDER', 'BATCH_ORDER', 'LIST_TRANSFER_COUNT', 'TOTAL_TRANSFER_COUNT', 'CHECKBOX_UNRECOGNIZED',
+  'LIST_GROUP_TIMEOUT', 'DETAIL_CLOSE_BUTTON_TIMEOUT', 'DETAIL_CLOSE_TIMEOUT', 'LIST_MISSING', 'LIST_TIMEOUT',
+  'STEP_CONTAINER_MISSING', 'STEP_TITLE_MISSING', 'TASK_ROW_UNRECOGNIZED', 'TASK_STATE_CHANGED', 'DETAIL_TIMEOUT',
+  'OPEN_COUNT_MISMATCH', 'COMPLETED_COUNT_MISMATCH', 'TASK_LIST_REMOUNTED', 'TASK_ROW_REMOUNTED', 'SCROLL_STALLED',
+  'BUILD_FAILED', 'DOWNLOAD_START_FAILED', 'DOWNLOAD_INTERRUPTED', 'DOWNLOAD_TIMEOUT', 'DOWNLOAD_STATUS_FAILED']);
 const targets = new Map();
 const sessions = new Map();
 const attaching = new Set();
@@ -90,7 +96,7 @@ function summary(target) {
 
 function reportStage(stage, count, options = {}) {
   lastStage = stage;
-  if (!['failed', 'cancelled', 'save-failed'].includes(stage)) lastActiveStage = stage;
+  if (!['failed', 'cancelled', 'list-error', 'save-failed'].includes(stage)) lastActiveStage = stage;
   log('export-stage', {stage, count: Number.isSafeInteger(count) ? count : undefined, ...options});
 }
 
@@ -122,12 +128,19 @@ function onMessage({data}) {
       break;
     }
     case 'Runtime.consoleAPICalled': {
-      const [marker, stage, count, intervalMs, scope] = (params.args ?? []).map(arg => arg.value);
+      const [marker, stage, count, intervalMs, scope, listIndex, retries, code, expected, observed, format] =
+        (params.args ?? []).map(arg => arg.value);
       if (target && !target.todo && marker === 'todo-export' && stages.has(stage)) {
         target.instrumented = true;
         reportStage(stage, count, {
           intervalMs: Number.isSafeInteger(intervalMs) ? intervalMs : undefined,
-          scope: ['all', 'open', 'completed'].includes(scope) ? scope : undefined});
+          scope: ['all', 'open', 'completed'].includes(scope) ? scope : undefined,
+          listIndex: Number.isSafeInteger(listIndex) ? listIndex : undefined,
+          retries: Number.isSafeInteger(retries) ? retries : undefined,
+          code: errorCodes.has(code) ? code : undefined,
+          expected: Number.isSafeInteger(expected) ? expected : undefined,
+          observed: Number.isSafeInteger(observed) ? observed : undefined,
+          format: ['csv', 'json'].includes(format) ? format : undefined});
       }
       break;
     }

@@ -1,4 +1,5 @@
 import {buildExportBlob, createSnapshot, exportName} from './export.mjs';
+import {sanitizeDiagnostic} from './diagnostics.mjs';
 
 const TODO_HOME = 'https://to-do.live.com/tasks/inbox';
 const TODO_ORIGIN = new URL(TODO_HOME).origin;
@@ -7,17 +8,91 @@ const ui = Object.fromEntries([...document.querySelectorAll('[id]')].map(element
 let currentRun;
 let snapshot;
 let saving = false;
+const pendingDiagnostics = new Set();
 
 const intervalPreference = 'todo-export-interval';
+function updateIntervalValidity() {
+  const intervalMs = ui.interval.valueAsNumber;
+  ui.interval.setCustomValidity(intervalMs > 0 && intervalMs < 250 ? '请输入 0 或 250–10000 之间的整数。' : '');
+}
+
 ui.interval.value = localStorage.getItem(intervalPreference) ?? '1000';
-if (!ui.interval.validity.valid) ui.interval.value = '1000';
+updateIntervalValidity();
+if (!ui.interval.validity.valid) {
+  ui.interval.value = '1000';
+  updateIntervalValidity();
+}
+ui.interval.addEventListener('input', updateIntervalValidity);
 ui.interval.addEventListener('change', () => {
+  updateIntervalValidity();
   if (ui.interval.validity.valid) localStorage.setItem(intervalPreference, ui.interval.value);
 });
 
-function stage(run, name, label, count) {
+function stage(run, name, label, {count = run.count, code, expected, observed, errorType} = {}) {
   if (label) run.lastStage = label;
-  console.info('todo-export', name, count, run.intervalMs, run.scope);
+  console.info('todo-export', name, count, run.intervalMs, run.scope, run.listIndex, run.retries, code, expected, observed);
+  recordStage(run, name, {count, code, expected, observed, errorType});
+}
+
+function recordStage(run, name, details) {
+  const event = sanitizeDiagnostic({
+    time: new Date().toISOString(), runId: run.id, stage: name, previousStage: run.phase,
+    count: run.count, scope: run.scope, intervalMs: run.intervalMs, listIndex: run.listIndex, retries: run.retries,
+    ...details,
+  });
+  if (!['list-error', 'read-error', 'failed', 'cancelled', 'save-failed'].includes(name)) run.phase = name;
+  const write = appendDiagnostic(event).finally(() => pendingDiagnostics.delete(write));
+  pendingDiagnostics.add(write);
+}
+
+async function appendDiagnostic(event) {
+  try {
+    const response = await chrome.runtime.sendMessage({type: 'diagnostic:append', event});
+    if (!response?.ok) throw new Error();
+  } catch {
+    ui['diagnostic-warning'].hidden = false;
+  }
+}
+
+async function downloadDiagnostics() {
+  const button = ui['download-diagnostics'];
+  const status = ui['diagnostic-status'];
+  button.disabled = true;
+  status.textContent = '正在读取诊断日志…';
+  try {
+    await Promise.all(pendingDiagnostics);
+    const response = await chrome.runtime.sendMessage({type: 'diagnostic:read'});
+    if (!response?.ok) throw new Error();
+    if (!response.events.length) {
+      status.textContent = '暂无诊断日志，请先复现导出问题。';
+      return;
+    }
+    const now = new Date();
+    const report = {
+      version: 1, extensionVersion: chrome.runtime.getManifest().version,
+      exportedAt: now.toISOString(), events: response.events,
+    };
+    const filename = exportName(now, 'json').replace('microsoft-todo-', 'microsoft-todo-diagnostics-');
+    const url = `data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(report, null, 2))}`;
+    try {
+      await chrome.downloads.download({url, filename, conflictAction: 'uniquify'});
+      status.textContent = '已发起诊断日志下载，可在 Chrome 下载列表查看。';
+    } catch {
+      status.textContent = '无法启动诊断日志下载，请重试。';
+    }
+  } catch {
+    status.textContent = '无法读取诊断日志，请重试。';
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function codedError(message, code, expected, observed) {
+  return Object.assign(new Error(message), {code, expected, observed});
+}
+
+function failureDetails(error) {
+  return {code: error?.code ?? 'UNKNOWN', errorType: error?.name, expected: error?.expected, observed: error?.observed};
 }
 
 function say(text) {
@@ -62,7 +137,7 @@ async function getReaderTab(run) {
     return await chrome.tabs.get(run.tabId);
   } catch {
     checkCancelled(run);
-    throw new Error(`读取标签页已关闭（最后阶段：${run.lastStage}）。请重新读取。`);
+    throw codedError(`读取标签页已关闭（最后阶段：${run.lastStage}）。请重新读取。`, 'TAB_CLOSED');
   }
 }
 
@@ -95,7 +170,7 @@ async function waitForTodo(run, login = false) {
         announcedLogin = true;
       }
     }
-    if (Date.now() - loadingSince > 30000) throw new Error('To Do 页面加载超时，请检查网络后重新读取。');
+    if (Date.now() - loadingSince > 30000) throw codedError('To Do 页面加载超时，请检查网络后重新读取。', 'PAGE_TIMEOUT');
     await delay(750, run);
   }
 }
@@ -117,8 +192,8 @@ function readTab(run) {
     let sequence = 0;
     let lastLogged = -Infinity;
     let settled = false;
-    const handshake = setTimeout(() => finish(reject, Object.assign(
-      new Error(`未能连接 To Do 页面（最后阶段：${run.lastStage}）。`), {code: 'DISCONNECTED'})), 5000);
+    const handshake = setTimeout(() => finish(reject, codedError(
+      `未能连接 To Do 页面（最后阶段：${run.lastStage}）。`, 'CONNECT_TIMEOUT')), 5000);
     function finish(callback, value) {
       if (settled) return;
       settled = true;
@@ -143,40 +218,67 @@ function readTab(run) {
       clearTimeout(handshake);
       try {
         switch (message.type) {
+          case 'ready':
+            recordStage(run, 'discover');
+            break;
           case 'list-start':
-            if (message.index !== lists.length + 1) throw new Error('清单接收顺序异常。');
+            if (message.index !== lists.length + 1) {
+              throw codedError('清单接收顺序异常。', 'LIST_ORDER', lists.length + 1, message.index);
+            }
+            run.listIndex = message.index;
+            run.retries = Number(message.retry);
+            run.count = message.count;
             draft = {...message.list, tasks: []};
             showProgress({...message, list: draft.name});
-            stage(run, message.retry ? 'retry' : 'scan', `读取清单 ${message.index}/${message.total}`, message.count);
+            stage(run, message.retry ? 'retry' : 'scan', `读取清单 ${message.index}/${message.total}`);
             lastLogged = performance.now();
             break;
           case 'progress':
+            run.count = message.count;
             showProgress(message);
-            if (performance.now() - lastLogged >= 1000) {
-              stage(run, 'scan', undefined, message.count);
+            if (performance.now() - lastLogged >= 5000) {
+              stage(run, 'scan');
               lastLogged = performance.now();
             }
             break;
+          case 'list-error':
+            run.listIndex = message.index;
+            run.retries = message.retries;
+            run.count = message.count;
+            stage(run, 'list-error', undefined, {code: message.code ?? 'UNKNOWN', expected: message.expected, observed: message.observed});
+            break;
           case 'batch':
-            if (!draft || message.sequence !== ++sequence) throw new Error('任务批次接收顺序异常。');
+            if (!draft || message.sequence !== sequence + 1) {
+              throw codedError('任务批次接收顺序异常。', 'BATCH_ORDER', sequence + 1, message.sequence);
+            }
+            sequence++;
             for (const task of message.tasks) draft.tasks.push(task);
             port.postMessage({type: 'ack', sequence});
             break;
           case 'list-end':
-            if (!draft || message.index !== lists.length + 1 || draft.tasks.length !== message.size) {
-              throw new Error('清单接收数量不符。');
+            if (message.index !== lists.length + 1) {
+              throw codedError('清单接收顺序异常。', 'LIST_ORDER', lists.length + 1, message.index);
+            }
+            if (!draft || draft.tasks.length !== message.size) {
+              throw codedError('清单接收数量不符。', 'LIST_TRANSFER_COUNT', message.size, draft?.tasks.length);
             }
             lists.push(draft);
             count += message.size;
-            stage(run, 'scan', undefined, count);
+            run.count = count;
+            stage(run, 'scan');
             draft = undefined;
             break;
           case 'done':
-            if (draft || lists.length !== message.total || count !== message.count) throw new Error('导出接收数量不符。');
+            if (draft || lists.length !== message.total) {
+              throw codedError('导出接收清单数不符。', 'TOTAL_TRANSFER_COUNT', message.total, lists.length);
+            }
+            if (count !== message.count) {
+              throw codedError('导出接收任务数不符。', 'TOTAL_TRANSFER_COUNT', message.count, count);
+            }
             finish(resolve, {lists, count});
             break;
           case 'error':
-            finish(reject, Object.assign(new Error(message.message), {code: message.code}));
+            finish(reject, codedError(message.message, message.code, message.expected, message.observed));
             break;
         }
       } catch (error) {
@@ -197,7 +299,11 @@ async function collect(run) {
     await waitForTodo(run, login);
     try {
       checkCancelled(run);
-      stage(run, 'discover', '识别清单');
+      run.listIndex = run.retries = undefined;
+      run.count = 0;
+      run.lastStage = '识别清单';
+      console.info('todo-export', 'discover', undefined, run.intervalMs, run.scope);
+      recordStage(run, 'inject');
       say('正在识别清单…');
       ui.progress.removeAttribute('value');
       try {
@@ -205,11 +311,13 @@ async function collect(run) {
       } catch {
         throw Object.assign(new Error('无法读取 To Do 页面，请确认扩展具有该网站的访问权限。'), {code: 'NOT_READY'});
       }
+      recordStage(run, 'connect');
       return await readTab(run);
     } catch (error) {
+      if (!run.controller.signal.aborted) recordStage(run, 'read-error', failureDetails(error));
       login = false;
       // A navigation can disconnect the port just before the login URL is visible.
-      const checks = ['DISCONNECTED', 'NOT_READY'].includes(error.code) ? 5 : 1;
+      const checks = ['DISCONNECTED', 'CONNECT_TIMEOUT', 'NOT_READY'].includes(error.code) ? 5 : 1;
       for (let i = 0; i < checks; i++) {
         if (tabLocation(await getReaderTab(run)) === 'login') {
           login = true;
@@ -224,7 +332,10 @@ async function collect(run) {
 
 async function startRead() {
   if (currentRun || saving || !ui.interval.reportValidity()) return;
-  const run = {controller: new AbortController(), scope: ui.scope.value, intervalMs: ui.interval.valueAsNumber};
+  const run = {
+    id: crypto.randomUUID(), controller: new AbortController(),
+    scope: ui.scope.value, intervalMs: ui.interval.valueAsNumber, count: 0,
+  };
   localStorage.setItem(intervalPreference, String(run.intervalMs));
   currentRun = run;
   snapshot = undefined;
@@ -237,7 +348,7 @@ async function startRead() {
   ui.progress.hidden = false;
   ui.progress.removeAttribute('value');
   say('正在打开 To Do 读取标签页…');
-  stage(run, 'open', '打开读取标签页', 0);
+  stage(run, 'open', '打开读取标签页');
 
   try {
     const current = await chrome.windows.getCurrent();
@@ -246,13 +357,21 @@ async function startRead() {
     run.tabId = tab.id;
     const {lists, count} = await collect(run);
     checkCancelled(run);
-    snapshot = createSnapshot(lists);
-    stage(run, 'ready', undefined, count);
+    snapshot = {
+      data: createSnapshot(lists),
+      run: {id: run.id, scope: run.scope, intervalMs: run.intervalMs, count, phase: 'ready', attempts: 0},
+    };
+    stage(run, 'ready', undefined, {count});
     say(`读取完成，共 ${lists.length} 个清单、${count} 条任务。`);
     ui.downloads.hidden = false;
     ui.start.textContent = '重新读取';
   } catch (error) {
-    stage(run, run.controller.signal.aborted ? 'cancelled' : 'failed');
+    const cancelled = run.controller.signal.aborted;
+    if (cancelled) {
+      stage(run, 'cancelled');
+    } else {
+      stage(run, 'failed', undefined, failureDetails(error));
+    }
     say(run.controller.signal.aborted ? '已取消读取。' : `读取失败。${error.message}`);
     ui.start.textContent = '重新读取';
   } finally {
@@ -271,14 +390,20 @@ async function save(format) {
   saving = true;
   ui.start.disabled = ui.csv.disabled = ui.json.disabled = true;
   const resultStatus = ui['download-status'];
-  const filename = exportName(new Date(snapshot.exportedAt), format);
-  const count = snapshot.lists.reduce((total, list) => total + list.tasks.length, 0);
+  const {data, run: sourceRun} = snapshot;
+  const filename = exportName(new Date(data.exportedAt), format);
+  const {count} = sourceRun;
+  const attempt = ++sourceRun.attempts;
+  const run = {...sourceRun};
   let url;
   let downloadId;
   let cleanupTimer;
   let finished = false;
+  let checkingInterrupt = false;
+  let interruptReason;
+  let failureCode = 'BUILD_FAILED';
 
-  function finish(message, ok = false) {
+  function finish(message, {code, errorType, interruptReason} = {}) {
     if (finished) return;
     finished = true;
     saving = false;
@@ -287,30 +412,59 @@ async function save(format) {
     if (url) URL.revokeObjectURL(url);
     ui.start.disabled = ui.csv.disabled = ui.json.disabled = false;
     resultStatus.textContent = message;
-    console.info('todo-export', ok ? 'saved' : 'save-failed', count);
+    console.info('todo-export', code ? 'save-failed' : 'saved', count, undefined, undefined,
+      undefined, undefined, code, undefined, undefined, format);
+    recordStage(run, code ? 'save-failed' : 'saved', {format, attempt, code, errorType, interruptReason});
   }
 
-  function changed(delta) {
-    if (downloadId === undefined || delta.id !== downloadId || !delta.state) return;
-    const state = delta.state.current;
-    if (state === 'complete' || state === 'interrupted') {
-      finish(state === 'complete' ? `已保存 ${filename}` : `下载中断，可重新下载 ${format.toUpperCase()}。`, state === 'complete');
+  function finishInterrupted() {
+    finish(`下载中断，可重新下载 ${format.toUpperCase()}。`, {code: 'DOWNLOAD_INTERRUPTED', interruptReason});
+  }
+
+  async function changed(delta) {
+    if (downloadId === undefined || delta.id !== downloadId || finished) return;
+    interruptReason = delta.error?.current ?? interruptReason;
+    if (delta.state?.current === 'complete') return finish(`已保存 ${filename}`);
+    if (checkingInterrupt && interruptReason) return finishInterrupted();
+    if (delta.state?.current !== 'interrupted' || checkingInterrupt) return;
+    checkingInterrupt = true;
+    if (!interruptReason) {
+      try {
+        const [item] = await chrome.downloads.search({id: downloadId});
+        interruptReason ??= item?.error;
+      } catch {
+        // The interrupted state is still known when Chrome cannot look up the reason.
+      }
     }
+    finishInterrupted();
   }
 
   try {
     console.info('todo-export', `build-${format}`, count);
+    recordStage(run, `build-${format}`, {format, attempt});
     resultStatus.textContent = `正在生成 ${format.toUpperCase()}…`;
-    url = URL.createObjectURL(await buildExportBlob(snapshot, format));
+    const blob = await buildExportBlob(data, format);
+    url = URL.createObjectURL(blob);
+    failureCode = 'DOWNLOAD_START_FAILED';
     chrome.downloads.onChanged.addListener(changed);
     console.info('todo-export', `download-${format}`, count);
+    recordStage(run, `download-${format}`, {format, attempt, bytes: blob.size});
     resultStatus.textContent = `正在下载 ${format.toUpperCase()}…`;
     downloadId = await chrome.downloads.download({url, filename, conflictAction: 'uniquify'});
-    cleanupTimer = setTimeout(() => finish('下载未在规定时间内完成，请查看 Chrome 下载列表。'), 300000);
+    cleanupTimer = setTimeout(() => {
+      if (checkingInterrupt) finishInterrupted();
+      else finish('下载未在规定时间内完成，请查看 Chrome 下载列表。', {code: 'DOWNLOAD_TIMEOUT'});
+    }, 300000);
+    failureCode = 'DOWNLOAD_STATUS_FAILED';
     const [item] = await chrome.downloads.search({id: downloadId});
-    if (item) changed({id: downloadId, state: {current: item.state}});
-  } catch {
-    finish(`保存失败，可重新下载 ${format.toUpperCase()}。`);
+    if (finished) return;
+    interruptReason ??= item?.error;
+    if (item?.state === 'complete') finish(`已保存 ${filename}`);
+    if (item?.state === 'interrupted' && (!checkingInterrupt || interruptReason)) finishInterrupted();
+  } catch (error) {
+    if (!checkingInterrupt) {
+      finish(`保存失败，可重新下载 ${format.toUpperCase()}。`, {code: failureCode, errorType: error?.name});
+    }
   }
 }
 
@@ -318,4 +472,5 @@ ui.start.addEventListener('click', startRead);
 ui.cancel.addEventListener('click', cancelRead);
 ui.csv.addEventListener('click', () => save('csv'));
 ui.json.addEventListener('click', () => save('json'));
+ui['download-diagnostics'].addEventListener('click', downloadDiagnostics);
 window.addEventListener('pagehide', cancelRead);
