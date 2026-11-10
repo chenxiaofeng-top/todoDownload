@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {createSnapshot, exportName, toCsv, toJson} from '../export.mjs';
+import {buildExportBlob, createSnapshot, exportName, toCsv, toJson} from '../export.mjs';
 
 const task = {
   id: 'task-one',
@@ -37,4 +37,14 @@ test('JSON retains an empty list and output names share the local timestamp', ()
   });
   assert.equal(exportName(when, 'csv'), 'microsoft-todo-20260102-030405.csv');
   assert.equal(exportName(when, 'json'), 'microsoft-todo-20260102-030405.json');
+});
+
+test('chunked files preserve the original formats across chunk boundaries', async () => {
+  const tasks = Array.from({length: 70}, (_, id) => ({...task, id: String(id), notes: '甲\u2028乙\n'.repeat(700)}));
+  const snapshot = createSnapshot([{id: 'inbox', name: '任务', tasks}, {id: 'empty', name: '空清单', tasks: []}]);
+  const json = await buildExportBlob(snapshot, 'json');
+  assert.equal(await json.text(), `${JSON.stringify(snapshot, null, 2)}\n`);
+  const csv = await buildExportBlob(snapshot, 'csv');
+  assert.deepEqual(new Uint8Array(await csv.arrayBuffer()), new TextEncoder().encode(toCsv(snapshot)));
+  assert.equal(toCsv(createSnapshot([{id: 'empty', name: '空清单', tasks: []}])), '\uFEFF"清单","标题","已完成","重要","截止日期","备注","子步骤"\r\n');
 });

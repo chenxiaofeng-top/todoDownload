@@ -22,6 +22,9 @@ header p, .hint { color: var(--muted); }
 .eyebrow { font-weight: 650; color: var(--accent); }
 section { padding: 1rem; border: 1px solid var(--border); border-radius: 0.65rem; }
 .actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.75rem; }
+.settings { display: grid; gap: 0.35rem; }
+.settings label:not(:first-child) { margin-top: 0.4rem; }
+.settings input, .settings select { font: inherit; padding: 0.35rem; width: 100%; }
 button { border: 1px solid var(--accent); border-radius: 0.35rem; padding: 0.45rem 0.7rem; background: var(--accent); color: var(--accent-text); font: inherit; font-weight: 650; cursor: pointer; }
 button.secondary { background: Canvas; color: var(--accent); }
 button:disabled { opacity: 0.55; cursor: default; }

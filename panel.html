@@ -12,14 +12,28 @@
       <header>
         <p class="eyebrow">Microsoft To Do</p>
         <h1>导出任务</h1>
-        <p>读取当前账号的普通清单、已完成任务、备注和子步骤。</p>
+        <p>导出当前账号的任务、备注和子步骤。</p>
       </header>
+      <section aria-labelledby="settings-title">
+        <h2 id="settings-title">读取设置</h2>
+        <div class="settings">
+          <label for="scope">任务范围</label>
+          <select id="scope">
+            <option value="all">全部任务</option>
+            <option value="open">仅未完成</option>
+            <option value="completed">仅已完成</option>
+          </select>
+          <label for="interval">读取动作间隔（毫秒）</label>
+          <input id="interval" type="number" min="250" max="10000" step="1" value="1000" required aria-describedby="interval-hint">
+          <p id="interval-hint" class="hint">间隔越长，导出越慢，可减少短时间内连续打开任务带来的请求。</p>
+        </div>
+      </section>
       <section aria-labelledby="status-title">
         <h2 id="status-title">读取状态</h2>
         <p id="status" role="status" aria-live="polite">准备就绪</p>
         <progress id="progress" aria-label="清单读取进度" hidden></progress>
         <div class="actions">
-          <button id="start" type="button">读取全部清单</button>
+          <button id="start" type="button">读取任务</button>
           <button id="cancel" class="secondary" type="button" hidden>取消读取</button>
         </div>
       </section>

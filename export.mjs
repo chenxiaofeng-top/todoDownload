@@ -8,11 +8,15 @@ function csvCell(value) {
   return `"${safe.replaceAll('"', '""')}"`;
 }
 
-export function toCsv({lists}) {
-  const rows = [CSV_HEADERS];
+function csvRow(row) {
+  return `${row.map(csvCell).join(',')}\r\n`;
+}
+
+function* csvParts({lists}) {
+  yield `\uFEFF${csvRow(CSV_HEADERS)}`;
   for (const {name, tasks} of lists) {
     for (const task of tasks) {
-      rows.push([
+      yield csvRow([
         name,
         task.title,
         task.completed ? '是' : '否',
@@ -23,11 +27,46 @@ export function toCsv({lists}) {
       ]);
     }
   }
-  return `\uFEFF${rows.map(row => row.map(csvCell).join(',')).join('\r\n')}\r\n`;
+}
+
+function* jsonParts({version, exportedAt, lists}) {
+  yield `{\n  "version": ${JSON.stringify(version)},\n  "exportedAt": ${JSON.stringify(exportedAt)},\n  "lists": [`;
+  for (const [index, {id, name, tasks}] of lists.entries()) {
+    yield `${index ? ',' : ''}\n    {\n      "id": ${JSON.stringify(id)},\n      "name": ${JSON.stringify(name)},\n      "tasks": [`;
+    for (const [offset, task] of tasks.entries()) {
+      const json = JSON.stringify(task, null, 2).replaceAll('\n', '\n        ');
+      yield `${offset ? ',' : ''}\n        ${json}`;
+    }
+    yield `${tasks.length ? '\n      ' : ''}]\n    }`;
+  }
+  yield `${lists.length ? '\n  ' : ''}]\n}\n`;
+}
+
+export function toCsv(snapshot) {
+  return [...csvParts(snapshot)].join('');
 }
 
 export function toJson(snapshot) {
-  return `${JSON.stringify(snapshot, null, 2)}\n`;
+  return [...jsonParts(snapshot)].join('');
+}
+
+export async function buildExportBlob(snapshot, format) {
+  const csv = format === 'csv';
+  const type = csv ? 'text/csv;charset=utf-8' : 'application/json';
+  const parts = [];
+  let buffer = [];
+  let length = 0;
+  for (const part of (csv ? csvParts(snapshot) : jsonParts(snapshot))) {
+    buffer.push(part);
+    length += part.length;
+    if (length >= 128 * 1024) {
+      parts.push(new Blob(buffer));
+      buffer = [];
+      length = 0;
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  }
+  return new Blob([...parts, ...buffer], {type});
 }
 
 export function createSnapshot(lists, now = new Date()) {
